@@ -11,3 +11,4 @@ checkpoints/
 *.log
 *.txt
 !requirements.txt
+encoded/

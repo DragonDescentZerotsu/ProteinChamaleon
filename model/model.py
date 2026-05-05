@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from transformers import Gemma4ForCausalLM
+from transformers import Gemma4ForCausalLM, Gemma4ForConditionalGeneration
 from transformers.models.gemma4.modeling_gemma4 import Gemma4TextScaledWordEmbedding
 
 from .config import ProteinChameleonConfig
@@ -84,26 +84,35 @@ class ProteinChameleonForCausalLM(Gemma4ForCausalLM):
           4. Copy pretrained text weights; init protein rows with small noise.
         """
         # ── 1. Load on CPU to get weights and config ──────────────────────────
-        base_cpu = Gemma4ForCausalLM.from_pretrained(
+        # google/gemma-4-* checkpoints are multimodal (Gemma4ForConditionalGeneration)
+        # and store text weights under model.language_model.* rather than model.*
+        # Loading as Gemma4ForCausalLM causes a key mismatch → random init.
+        # Fix: load the full multimodal model, remap keys, inject into CausalLM.
+        full_cpu = Gemma4ForConditionalGeneration.from_pretrained(
             gemma_model_name_or_path,
             torch_dtype=torch_dtype,
             device_map="cpu",
         )
-        orig_vocab = base_cpu.config.vocab_size
-        base_state = {
-            k: v.to(torch_dtype).clone()
-            for k, v in base_cpu.state_dict().items()
-        }
-        base_cfg = base_cpu.config
-        del base_cpu
+        base_cfg = full_cpu.config.text_config
+        orig_vocab = base_cfg.vocab_size
+
+        # Remap model.language_model.* → model.* so CausalLM can consume them
+        full_sd = full_cpu.state_dict()
+        base_state = {}
+        for k, v in full_sd.items():
+            if k.startswith("model.language_model."):
+                base_state["model." + k[len("model.language_model."):]] = v.to(torch_dtype).clone()
+            elif k in ("lm_head.weight",):
+                base_state[k] = v.to(torch_dtype).clone()
+        del full_cpu, full_sd
         torch.cuda.empty_cache()
 
-        # ── 2. Reload with caller's kwargs (quantization, device_map, etc.) ───
-        base = Gemma4ForCausalLM.from_pretrained(
-            gemma_model_name_or_path,
-            torch_dtype=torch_dtype,
-            **kwargs,
-        )
+        # ── 2. Build Gemma4ForCausalLM from text config and load remapped weights
+        base = Gemma4ForCausalLM(base_cfg).to(torch_dtype)
+        missing, unexpected = base.load_state_dict(base_state, strict=False)
+        if missing:
+            raise RuntimeError(f"from_gemma: {len(missing)} missing keys after remap — {missing[:5]}")
+        del base_state
 
         # ── 3. Build ProteinChameleon config ──────────────────────────────────
         config = ProteinChameleonConfig(
