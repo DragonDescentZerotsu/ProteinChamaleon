@@ -55,6 +55,10 @@ def _chunk_npz_path(pkl_path: Path) -> Path:
     return OUT_DIR / f"stage2_{pkl_path.stem}.npz"
 
 
+def _sub_npz_path(pkl_path: Path, start: int, end: int) -> Path:
+    return OUT_DIR / f"stage2_{pkl_path.stem}_{start}_{end}.npz"
+
+
 def encode_chunk(bpe, chunk_data: dict) -> dict:
     ids_out, acc_out, func_out, org_out = [], [], [], []
     failed = 0
@@ -103,27 +107,31 @@ def save_npz(path: Path, result: dict) -> None:
     )
 
 
+def _get_chunk_size(pkl_path_str: str) -> tuple:
+    with open(pkl_path_str, "rb") as f:
+        data = pickle.load(f)
+    return pkl_path_str, len(data["accessions"])
+
+
 def _worker(task: tuple) -> tuple:
     """Fork worker: uses _bpe inherited from parent via CoW."""
-    pkl_path_str, npz_path_str = task
+    pkl_path_str, npz_path_str, start, end = task
     pkl_path = Path(pkl_path_str)
     npz_path = Path(npz_path_str)
-    logger.info("Encoding %s ...", pkl_path.name)
     with open(pkl_path, "rb") as f:
         chunk_data = pickle.load(f)
-    result = encode_chunk(_bpe, chunk_data)
+    sub = {k: chunk_data[k][start:end]
+           for k in ("structures", "accessions", "function_text", "organism")}
+    result = encode_chunk(_bpe, sub)
     save_npz(npz_path, result)
     return len(result["token_ids"]), result["failed"], npz_path.name
 
 
 def merge(all_chunks: list) -> None:
-    logger.info("Merging %d chunks into %s ...", len(all_chunks), OUT_FILE)
+    all_npz = sorted(OUT_DIR.glob("stage2_chunk_*_*_*.npz"))
+    logger.info("Merging %d sub-chunk npz files into %s ...", len(all_npz), OUT_FILE)
     all_ids, all_acc, all_func, all_org = [], [], [], []
-    for pkl in all_chunks:
-        npz = _chunk_npz_path(pkl)
-        if not npz.exists():
-            logger.warning("Missing %s — skipped in merge", npz.name)
-            continue
+    for npz in all_npz:
         data = np.load(npz, allow_pickle=True)
         all_ids.extend(data["token_ids"])
         all_acc.extend(data["accessions"])
@@ -163,10 +171,25 @@ def main(args):
         if not _chunk_npz_path(pkl).exists()
     ]
 
+    # Scan chunk sizes to build sub-chunk task list (before loading BPE to keep RAM clean)
+    logger.info("Scanning %d chunk sizes ...", len(all_chunks))
+    with multiprocessing.Pool(min(8, len(all_chunks))) as p:
+        sizes = dict(p.map(_get_chunk_size, [str(c) for c in all_chunks]))
+
+    pending = []
+    for pkl in all_chunks:
+        n = sizes[str(pkl)]
+        for start in range(0, n, args.sub_chunk_size):
+            end = min(start + args.sub_chunk_size, n)
+            npz = _sub_npz_path(pkl, start, end)
+            if not npz.exists():
+                pending.append((str(pkl), str(npz), start, end))
+
     if not pending:
-        logger.info("All chunks already encoded.")
+        logger.info("All sub-chunks already encoded.")
     else:
-        logger.info("%d chunks to encode with %d workers", len(pending), args.num_workers)
+        logger.info("%d sub-chunks to encode with %d workers (sub-chunk size=%d)",
+                    len(pending), args.num_workers, args.sub_chunk_size)
         logger.info("Loading BPE checkpoint from %s ...", BPE_CKPT)
         with open(BPE_CKPT, "rb") as f:
             _bpe = pickle.load(f)
@@ -188,8 +211,9 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--num-workers", type=int, default=multiprocessing.cpu_count())
-    parser.add_argument("--merge-only",  action="store_true")
+    parser.add_argument("--num-workers",    type=int, default=multiprocessing.cpu_count())
+    parser.add_argument("--sub-chunk-size", type=int, default=500)
+    parser.add_argument("--merge-only",     action="store_true")
     parser.add_argument("--merge",       action="store_true", help="merge after encoding")
     parser.add_argument("--bpe-ckpt",    default=str(BPE_CKPT))
     parser.add_argument("--feat-dir",    default=str(FEAT_DIR))
