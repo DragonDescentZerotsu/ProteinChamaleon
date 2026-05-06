@@ -71,7 +71,7 @@ class WarmupTrainer(Trainer):
             protein_logits.reshape(-1, self.protein_vocab_size),
             protein_labels.reshape(-1),
             ignore_index=-100,
-        )
+        ) / self.args.gradient_accumulation_steps
         return (loss, outputs) if return_outputs else loss
 
 

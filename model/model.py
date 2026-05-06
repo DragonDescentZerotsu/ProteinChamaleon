@@ -112,6 +112,11 @@ class ProteinChameleonForCausalLM(Gemma4ForCausalLM):
         missing, unexpected = base.load_state_dict(base_state, strict=False)
         if missing:
             raise RuntimeError(f"from_gemma: {len(missing)} missing keys after remap — {missing[:5]}")
+
+        embed_w = base_state.get("model.embed_tokens.weight")
+        if embed_w is None:
+            embed_w = base_state.get("lm_head.weight")
+        per_layer_w = base_state.get("model.embed_tokens_per_layer.weight")
         del base_state
 
         # ── 3. Build ProteinChameleon config ──────────────────────────────────
@@ -131,9 +136,6 @@ class ProteinChameleonForCausalLM(Gemma4ForCausalLM):
         new_lm_head = nn.Linear(hidden_size, total_vocab, bias=False).to("cpu").to(torch_dtype)
 
         # Gemma ties lm_head.weight to embed_tokens.weight — use whichever exists
-        embed_w = base_state.get("model.embed_tokens.weight")
-        if embed_w is None:
-            embed_w = base_state.get("lm_head.weight")
 
         with torch.no_grad():
             new_embed.weight[:orig_vocab]    = embed_w.cpu()
@@ -148,7 +150,6 @@ class ProteinChameleonForCausalLM(Gemma4ForCausalLM):
 
         # ── 4b. Expand embed_tokens_per_layer (Gemma4-specific per-layer input embedding) ─
         per_layer_emb = getattr(base.model, "embed_tokens_per_layer", None)
-        per_layer_w   = base_state.get("model.embed_tokens_per_layer.weight")
         if per_layer_emb is not None and per_layer_w is not None:
             per_layer_dim = per_layer_w.shape[1]
             embed_scale   = per_layer_emb.scalar_embed_scale
