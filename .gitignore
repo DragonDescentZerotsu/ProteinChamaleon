@@ -13,3 +13,4 @@ checkpoints/
 !requirements.txt
 encoded
 encoded/
+eval_results/
