@@ -23,9 +23,20 @@ Usage:
 import argparse
 import logging
 import multiprocessing
+import os
 import pickle
 import sys
+import time
+import warnings
 from pathlib import Path
+
+# ── Silence everything noisy before any imports ────────────────────────────
+warnings.filterwarnings("ignore")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+logging.captureWarnings(True)
+for _noisy in ("transformers", "torch", "foldingdiff", "esm", "urllib3",
+               "filelock", "huggingface_hub", "py.warnings"):
+    logging.getLogger(_noisy).setLevel(logging.ERROR)
 
 import numpy as np
 import pandas as pd
@@ -36,18 +47,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "PT-BPE"))
 from foldingdiff.tokenizer import Tokenizer
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%H:%M:%S",
+    level=logging.WARNING,          # only our logger prints below WARNING
+    format="%(message)s",
 )
 logger = logging.getLogger("encode_stage2")
+logger.setLevel(logging.INFO)
 
 BPE_CKPT = Path("/data/steven/PT-BPE/ckpts/swissprot_michael/bpe_post_init.pkl")
 FEAT_DIR = Path("/data/steven/ProteinChamaleon/encoded/featurized")
 OUT_DIR  = Path("/data/steven/ProteinChamaleon/encoded")
 OUT_FILE = OUT_DIR / "stage2.npz"
 
-# Inherited by forked workers — never set directly in worker processes
+# Inherited by forked workers via CoW — never assigned in workers
 _bpe = None
 
 
@@ -59,6 +70,12 @@ def _sub_npz_path(pkl_path: Path, start: int, end: int) -> Path:
     return OUT_DIR / f"stage2_{pkl_path.stem}_{start}_{end}.npz"
 
 
+def _worker_init():
+    """Silence all warnings/logging in forked workers."""
+    warnings.filterwarnings("ignore")
+    logging.disable(logging.CRITICAL)
+
+
 def encode_chunk(bpe, chunk_data: dict) -> dict:
     ids_out, acc_out, func_out, org_out = [], [], [], []
     failed = 0
@@ -68,8 +85,7 @@ def encode_chunk(bpe, chunk_data: dict) -> dict:
         chunk_data["function_text"],
         chunk_data["organism"],
     )
-    for struct, acc, func, org in tqdm(rows, total=len(chunk_data["accessions"]),
-                                       desc="  encoding", leave=False):
+    for struct, acc, func, org in rows:
         if struct is None:
             failed += 1
             continue
@@ -82,8 +98,7 @@ def encode_chunk(bpe, chunk_data: dict) -> dict:
             acc_out.append(acc)
             func_out.append(func)
             org_out.append(str(org))
-        except Exception as e:
-            logger.warning("Failed %s: %s", acc, e)
+        except Exception:
             failed += 1
     return {
         "token_ids":     ids_out,
@@ -116,9 +131,8 @@ def _get_chunk_size(pkl_path_str: str) -> tuple:
 def _worker(task: tuple) -> tuple:
     """Fork worker: uses _bpe inherited from parent via CoW."""
     pkl_path_str, npz_path_str, start, end = task
-    pkl_path = Path(pkl_path_str)
     npz_path = Path(npz_path_str)
-    with open(pkl_path, "rb") as f:
+    with open(pkl_path_str, "rb") as f:
         chunk_data = pickle.load(f)
     sub = {k: chunk_data[k][start:end]
            for k in ("structures", "accessions", "function_text", "organism")}
@@ -127,11 +141,16 @@ def _worker(task: tuple) -> tuple:
     return len(result["token_ids"]), result["failed"], npz_path.name
 
 
+def _print(msg: str) -> None:
+    tqdm.write(msg)
+
+
 def merge(all_chunks: list) -> None:
     all_npz = sorted(OUT_DIR.glob("stage2_chunk_*_*_*.npz"))
-    logger.info("Merging %d sub-chunk npz files into %s ...", len(all_npz), OUT_FILE)
+    _print(f"\n  Merging {len(all_npz)} sub-chunk files → {OUT_FILE.name}")
     all_ids, all_acc, all_func, all_org = [], [], [], []
-    for npz in all_npz:
+    for npz in tqdm(all_npz, desc="  merging", unit="file",
+                    bar_format="  {l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]"):
         data = np.load(npz, allow_pickle=True)
         all_ids.extend(data["token_ids"])
         all_acc.extend(data["accessions"])
@@ -148,7 +167,7 @@ def merge(all_chunks: list) -> None:
         function_text=np.array(all_func, dtype=object),
         organism=np.array(all_org,   dtype=object),
     )
-    logger.info("Done. Saved %d proteins to %s", len(all_ids), OUT_FILE)
+    _print(f"\n  Saved {len(all_ids):,} proteins → {OUT_FILE}")
 
 
 def main(args):
@@ -158,24 +177,35 @@ def main(args):
 
     all_chunks = sorted(FEAT_DIR.glob("chunk_*.pkl"))
     if not all_chunks:
-        logger.error("No featurized chunks in %s — run featurize_stage2.py first", FEAT_DIR)
+        _print(f"ERROR: no featurized chunks in {FEAT_DIR} — run featurize_stage2.py first")
         return
 
     if args.merge_only:
         merge(all_chunks)
         return
 
-    pending = [
-        (str(pkl), str(_chunk_npz_path(pkl)))
-        for pkl in all_chunks
-        if not _chunk_npz_path(pkl).exists()
-    ]
+    # ── Scan chunk sizes ───────────────────────────────────────────────────
+    _print(f"\n{'─'*60}")
+    _print(f"  ProteinChameleon Stage 2 — Encoding")
+    _print(f"{'─'*60}")
+    _print(f"  Chunks found : {len(all_chunks)}")
+    _print(f"  Workers      : {args.num_workers}")
+    _print(f"  Sub-chunk sz : {args.sub_chunk_size} proteins/task")
+    _print(f"{'─'*60}\n")
 
-    # Scan chunk sizes to build sub-chunk task list (before loading BPE to keep RAM clean)
-    logger.info("Scanning %d chunk sizes ...", len(all_chunks))
+    _print("  Scanning chunk sizes...")
     with multiprocessing.Pool(min(8, len(all_chunks))) as p:
-        sizes = dict(p.map(_get_chunk_size, [str(c) for c in all_chunks]))
+        sizes = dict(
+            tqdm(
+                p.imap_unordered(_get_chunk_size, [str(c) for c in all_chunks]),
+                total=len(all_chunks),
+                desc="  scanning",
+                unit="chunk",
+                bar_format="  {l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]",
+            )
+        )
 
+    # ── Build task list ────────────────────────────────────────────────────
     pending = []
     for pkl in all_chunks:
         n = sizes[str(pkl)]
@@ -185,25 +215,60 @@ def main(args):
             if not npz.exists():
                 pending.append((str(pkl), str(npz), start, end))
 
+    total_tasks   = sum(
+        len(range(0, sizes[str(p)], args.sub_chunk_size)) for p in all_chunks
+    )
+    already_done  = total_tasks - len(pending)
+    total_proteins = sum(sizes.values())
+
+    _print(f"\n  Tasks total  : {total_tasks:,}  ({already_done:,} already done, {len(pending):,} pending)")
+    _print(f"  Proteins     : {total_proteins:,} total\n")
+
     if not pending:
-        logger.info("All sub-chunks already encoded.")
+        _print("  All sub-chunks already encoded.")
     else:
-        logger.info("%d sub-chunks to encode with %d workers (sub-chunk size=%d)",
-                    len(pending), args.num_workers, args.sub_chunk_size)
-        logger.info("Loading BPE checkpoint from %s ...", BPE_CKPT)
+        # ── Load BPE ──────────────────────────────────────────────────────
+        _print(f"  Loading BPE checkpoint...")
+        t0 = time.time()
         with open(BPE_CKPT, "rb") as f:
             _bpe = pickle.load(f)
-        logger.info("BPE loaded. Forking workers (CoW — no extra RAM per worker)...")
+        _print(f"  BPE loaded in {time.time()-t0:.1f}s  →  forking {args.num_workers} workers\n")
 
-        # fork inherits _bpe — workers share the 6GB BPE object read-only
+        # ── Encode ────────────────────────────────────────────────────────
         ctx = multiprocessing.get_context("fork")
-        total_failed = 0
-        with ctx.Pool(processes=args.num_workers) as pool:
-            for n_enc, n_fail, name in pool.imap_unordered(_worker, pending):
-                total_failed += n_fail
-                logger.info("  ✓ %s — %d encoded, %d failed", name, n_enc, n_fail)
+        total_encoded = already_done * args.sub_chunk_size   # rough starting estimate
+        total_failed  = 0
 
-        logger.info("Encode complete. Total failed: %d", total_failed)
+        bar = tqdm(
+            total=len(pending),
+            desc="  encoding",
+            unit="task",
+            dynamic_ncols=True,
+            bar_format=(
+                "  {l_bar}{bar}| {n_fmt}/{total_fmt} tasks"
+                "  [{elapsed}<{remaining}, {rate_fmt}]"
+                "  {postfix}"
+            ),
+        )
+        bar.set_postfix(encoded=0, failed=0, refresh=False)
+
+        with ctx.Pool(processes=args.num_workers, initializer=_worker_init) as pool:
+            n_enc_total = 0
+            for n_enc, n_fail, name in pool.imap_unordered(_worker, pending):
+                n_enc_total  += n_enc
+                total_failed += n_fail
+                bar.set_postfix(encoded=f"{n_enc_total:,}", failed=total_failed, refresh=False)
+                bar.update(1)
+                # one-line completion note above the bar
+                fail_str = f"  {n_fail} failed" if n_fail else ""
+                tqdm.write(f"  ✓  {name:<45}  {n_enc:>4} encoded{fail_str}")
+
+        bar.close()
+        _print(f"\n{'─'*60}")
+        _print(f"  Encoding complete")
+        _print(f"  Encoded : {n_enc_total:,}")
+        _print(f"  Failed  : {total_failed:,}")
+        _print(f"{'─'*60}\n")
 
     if args.merge:
         merge(all_chunks)
@@ -214,10 +279,10 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers",    type=int, default=multiprocessing.cpu_count())
     parser.add_argument("--sub-chunk-size", type=int, default=500)
     parser.add_argument("--merge-only",     action="store_true")
-    parser.add_argument("--merge",       action="store_true", help="merge after encoding")
-    parser.add_argument("--bpe-ckpt",    default=str(BPE_CKPT))
-    parser.add_argument("--feat-dir",    default=str(FEAT_DIR))
-    parser.add_argument("--out-dir",     default=str(OUT_DIR))
+    parser.add_argument("--merge",          action="store_true", help="merge after encoding")
+    parser.add_argument("--bpe-ckpt",       default=str(BPE_CKPT))
+    parser.add_argument("--feat-dir",       default=str(FEAT_DIR))
+    parser.add_argument("--out-dir",        default=str(OUT_DIR))
     args = parser.parse_args()
     BPE_CKPT = Path(args.bpe_ckpt)
     FEAT_DIR  = Path(args.feat_dir)
