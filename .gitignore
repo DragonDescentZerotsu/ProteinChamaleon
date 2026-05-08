@@ -11,4 +11,6 @@ checkpoints/
 *.log
 *.txt
 !requirements.txt
+encoded
 encoded/
+eval_results/

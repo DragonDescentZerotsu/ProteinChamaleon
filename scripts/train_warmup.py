@@ -2,8 +2,10 @@
 Stage 1 — Protein token warmup training.
 
 Trains ProteinChameleonForCausalLM on protein-only token sequences using
-next-token prediction. Designed for A100 (40GB) — runs Gemma4 E4B in BF16
-with LoRA, no quantization needed.
+next-token prediction. Stage 1's only job is to give the new vocab rows
+(PROT_START, PROT_END, ~2100 structure tokens) reasonable representations,
+so all of Gemma is frozen and only the new rows of embed_tokens / lm_head
+are updated. Stage 2 handles modality integration (LoRA / full FT there).
 
 Input:  warmup.npz (pre-encoded PT-BPE token arrays)
 Output: checkpoints/warmup/
@@ -27,7 +29,6 @@ import torch
 from torch.utils.data import Dataset, Subset
 import torch.nn.functional as F
 from transformers import TrainingArguments, Trainer
-from peft import LoraConfig, get_peft_model, TaskType
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from model import ProteinChameleonTokenizer, ProteinChameleonForCausalLM
@@ -47,6 +48,11 @@ class WarmupTrainer(Trainer):
         super().__init__(*args, **kwargs)
         self.protein_token_offset = protein_token_offset
         self.protein_vocab_size   = protein_vocab_size
+        # Force Trainer's legacy loss-normalization path: divide by grad_accum
+        # once inside training_step. Our compute_loss returns plain per-batch
+        # mean CE; without this flag, modern Trainer takes the num_items_in_batch
+        # path and over-reports train loss by exactly grad_accum.
+        self.model_accepts_loss_kwargs = False
 
     def compute_loss(self, model, inputs, num_items_in_batch=None, return_outputs=False, **kwargs):
         labels = inputs.pop("labels")
@@ -71,7 +77,7 @@ class WarmupTrainer(Trainer):
             protein_logits.reshape(-1, self.protein_vocab_size),
             protein_labels.reshape(-1),
             ignore_index=-100,
-        ) / self.args.gradient_accumulation_steps
+        )
         return (loss, outputs) if return_outputs else loss
 
 
@@ -132,6 +138,9 @@ def main(args):
 
     # ── Model ─────────────────────────────────────────────────────────────────
     logger.info("Loading %s", args.base_model)
+    # Load the bulk of Gemma in bf16 to keep memory tractable; we'll selectively
+    # cast just the trainable embedding matrix to fp32 below so AdamW has stable
+    # master weights / optimizer states for the only params we actually update.
     model = ProteinChameleonForCausalLM.from_gemma(
         args.base_model,
         tokenizer=tokenizer,
@@ -140,19 +149,35 @@ def main(args):
         device_map="auto",
     )
 
-    lora_cfg = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=16,
-        lora_alpha=32,
-        lora_dropout=0.05,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        bias="none",
-    )
-    model = get_peft_model(model, lora_cfg)
+    # Cast the trainable embedding (and tied lm_head) to fp32. With bf16 leaf
+    # params, AdamW stores moments in bf16 and the second moment underflows
+    # within ~2 steps → NaN gradients. fp32 here costs only ~2-4 GB extra and
+    # is well worth it.
+    emb_module = model.get_input_embeddings()
+    emb_module.weight.data = emb_module.weight.data.float()
+    lm_head_module = model.get_output_embeddings()
+    if lm_head_module.weight.data_ptr() != emb_module.weight.data_ptr():
+        lm_head_module.weight.data = lm_head_module.weight.data.float()
 
-    # Only train new rows: <PROT_START>, <PROT_END>, and structure tokens.
-    # prot_start_id is the first ID added beyond the original Gemma vocab (262144),
-    # so zeroing rows below it leaves all original text rows frozen.
+    # Initialize new vocab rows (PROT_START, PROT_END, structure tokens) from
+    # the empirical distribution of the original embedding rows. Leaving them
+    # at zero makes the first step's grad_norm spike (here: 57 at step 1).
+    with torch.no_grad():
+        emb = model.get_input_embeddings().weight
+        n_orig_rows = tokenizer.prot_start_id
+        orig_mean = emb[:n_orig_rows].mean(dim=0)
+        orig_std  = emb[:n_orig_rows].std(dim=0).mean().item()
+        emb[n_orig_rows:].normal_(mean=0.0, std=orig_std * 0.1)
+        emb[n_orig_rows:] += orig_mean
+        # Gemma ties lm_head to embed_tokens, but if untied for any reason,
+        # mirror the init so logits aren't degenerate.
+        lm_head_w = model.get_output_embeddings().weight
+        if lm_head_w.data_ptr() != emb.data_ptr():
+            lm_head_w[n_orig_rows:].copy_(emb[n_orig_rows:])
+
+    # Freeze everything; selectively unfreeze the embedding/lm_head matrices
+    # and zero the gradient rows for the original Gemma vocab so only the new
+    # rows (PROT_START, PROT_END, structure tokens) actually move.
     orig_vocab = tokenizer.prot_start_id
 
     def _make_protein_only_hook(n_orig):
@@ -162,12 +187,28 @@ def main(args):
             return grad
         return _hook
 
+    for param in model.parameters():
+        param.requires_grad_(False)
+
+    trainable_params = []
+    seen = set()
     for name, param in model.named_parameters():
         if "embed_tokens" in name or "lm_head" in name:
+            if id(param) in seen:
+                continue
+            seen.add(id(param))
             param.requires_grad_(True)
             param.register_hook(_make_protein_only_hook(orig_vocab))
+            trainable_params.append((name, param))
 
-    model.print_trainable_parameters()
+    n_train = sum(p.numel() for _, p in trainable_params)
+    n_total = sum(p.numel() for p in model.parameters())
+    logger.info(
+        "Trainable: %d params across %d tensors  (%.4f%% of %d total). "
+        "Grad-row mask zeros indices [0, %d); only rows [%d:] update.",
+        n_train, len(trainable_params), 100 * n_train / n_total, n_total,
+        orig_vocab, orig_vocab,
+    )
 
     # ── Training ──────────────────────────────────────────────────────────────
     collator = ProteinCollator(pad_id=tokenizer.pad_id)
@@ -182,10 +223,10 @@ def main(args):
         eval_steps=50,
         save_steps=200,
         logging_steps=5,
-        learning_rate=5e-5,
+        learning_rate=1e-4,
         lr_scheduler_type="cosine",
         warmup_steps=100,
-        max_grad_norm=1.0,
+        max_grad_norm=5.0,
         bf16=True,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
