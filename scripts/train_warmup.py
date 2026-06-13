@@ -234,7 +234,7 @@ def main(args):
         remove_unused_columns=False,
         report_to="wandb",
         run_name="warmup-stage1",
-        save_total_limit=3,
+        save_total_limit=None,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
     )
@@ -252,6 +252,7 @@ def main(args):
     logger.info("Starting warmup training for %d steps", args.steps)
     trainer.train()
     trainer.save_model(str(out_dir / "final"))
+    tokenizer.text_tokenizer.save_pretrained(str(out_dir / "final"))
     logger.info("Done. Saved to %s", out_dir / "final")
 
 

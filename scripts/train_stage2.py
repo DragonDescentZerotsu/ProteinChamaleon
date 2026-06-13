@@ -273,6 +273,13 @@ class Stage2Trainer(Trainer):
         self.model_accepts_loss_kwargs = False
         self._weighted_sampler = weighted_sampler
 
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        inputs = self._prepare_inputs(inputs)
+        with torch.no_grad():
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(model, inputs)
+        return loss.detach(), None, None
+
     def get_train_dataloader(self) -> DataLoader:
         if self._weighted_sampler is None:
             return super().get_train_dataloader()
@@ -288,23 +295,37 @@ class Stage2Trainer(Trainer):
     def compute_loss(self, model, inputs, num_items_in_batch=None, return_outputs=False, **kwargs):
         loss_mask = inputs.pop("loss_mask")          # [B, T]
         outputs   = model(**inputs)
-        logits    = outputs.logits                   # [B, T, V]
+        logits    = outputs.logits                   # [B, T, V]  bf16
 
         # shift for next-token prediction
-        shift_logits = logits[:, :-1, :].float().contiguous()   # [B, T-1, V]
+        shift_logits = logits[:, :-1, :].contiguous()           # [B, T-1, V]  stay bf16
         shift_labels = inputs["input_ids"][:, 1:].contiguous()  # [B, T-1]
         shift_mask   = loss_mask[:, 1:].contiguous()            # [B, T-1]
+
+        # free the full logits tensor before the CE allocation
+        del logits
+        if not return_outputs:
+            del outputs
 
         # mask non-supervised positions
         labels = shift_labels.clone()
         labels[shift_mask == 0] = -100
 
-        loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            labels.view(-1),
-            ignore_index=-100,
-        )
-        return (loss, outputs) if return_outputs else loss
+        flat_labels = labels.view(-1)
+        n_valid = (flat_labels != -100).sum()
+        if n_valid == 0:
+            # all positions masked — return zero loss to avoid 0/0 = NaN
+            loss = shift_logits.sum() * 0
+        else:
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                flat_labels,
+                ignore_index=-100,
+                reduction="sum",
+            ) / n_valid
+        if return_outputs:
+            return loss, outputs
+        return loss
 
 
 # ── Weighted sampler ──────────────────────────────────────────────────────────
@@ -380,7 +401,7 @@ def main(args):
         gradient_accumulation_steps = args.grad_accum,
         eval_strategy               = "steps",
         eval_steps                  = 200,
-        save_steps                  = 500,
+        save_steps                  = 200,
         logging_steps               = 10,
         learning_rate               = args.lr,
         lr_scheduler_type           = "cosine",
@@ -396,7 +417,7 @@ def main(args):
         remove_unused_columns       = False,
         report_to                   = "wandb",
         run_name                    = "stage2-mixed",
-        save_total_limit            = 3,
+        save_total_limit            = None,
         load_best_model_at_end      = True,
         metric_for_best_model       = "eval_loss",
     )
@@ -427,9 +448,9 @@ if __name__ == "__main__":
     parser.add_argument("--interleaved-dir",default="/data/steven/ProteinChamaleon/encoded/stage2")
     parser.add_argument("--out-dir",        default="checkpoints/stage2")
     parser.add_argument("--max-length",     type=int,   default=4096)
-    parser.add_argument("--batch-size",     type=int,   default=2,
+    parser.add_argument("--batch-size",     type=int,   default=1,
                         help="Per-device batch size (each example is a packed window)")
-    parser.add_argument("--grad-accum",     type=int,   default=16,
+    parser.add_argument("--grad-accum",     type=int,   default=32,
                         help="Gradient accumulation steps → effective batch ~128k tokens")
     parser.add_argument("--steps",          type=int,   default=10_000)
     parser.add_argument("--lr",             type=float, default=5e-5)

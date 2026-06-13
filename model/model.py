@@ -49,19 +49,30 @@ class ProteinChameleonForCausalLM(Gemma4ForCausalLM):
         self.model.embed_tokens = nn.Embedding(total_vocab, hidden_size)
         self.lm_head = nn.Linear(hidden_size, total_vocab, bias=False)
 
+        # super().__init__ sizes embed_tokens_per_layer from text_config.vocab_size
+        # (the original Gemma vocab), not from our expanded vocab_size. Resize it.
+        per_layer = getattr(self.model, "embed_tokens_per_layer", None)
+        if per_layer is not None and per_layer.weight.shape[0] != total_vocab:
+            self.model.embed_tokens_per_layer = Gemma4TextScaledWordEmbedding(
+                total_vocab,
+                per_layer.weight.shape[1],
+                padding_idx=per_layer.padding_idx,
+                embed_scale=per_layer.scalar_embed_scale,
+            )
+
         self.post_init()
 
-    def tie_weights(self):
+    def tie_weights(self, **kwargs):
         # Gemma ties lm_head ↔ embed_tokens for text rows only.
         # Protein token rows are intentionally untied — super().tie_weights() would
         # overwrite the learned lm_head protein rows with embed_tokens values.
         offset = self.config.protein_token_offset
         if offset == 0:
-            super().tie_weights()
+            super().tie_weights(**kwargs)
             return
         with torch.no_grad():
             saved = self.lm_head.weight[offset:].clone()
-        super().tie_weights()
+        super().tie_weights(**kwargs)
         with torch.no_grad():
             self.lm_head.weight[offset:] = saved
 
