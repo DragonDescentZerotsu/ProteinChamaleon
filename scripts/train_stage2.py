@@ -400,8 +400,8 @@ def main(args):
         per_device_eval_batch_size  = args.batch_size,
         gradient_accumulation_steps = args.grad_accum,
         eval_strategy               = "steps",
-        eval_steps                  = 200,
-        save_steps                  = 200,
+        eval_steps                  = 500,
+        save_steps                  = 500,
         logging_steps               = 10,
         learning_rate               = args.lr,
         lr_scheduler_type           = "cosine",
@@ -436,7 +436,10 @@ def main(args):
         "Dataset: %d alignment + %d interleaved = %d total train examples",
         len(align_train), len(inter_train), len(train_dataset),
     )
-    trainer.train()
+    resume = args.resume_from_checkpoint
+    if isinstance(resume, str) and resume.lower() == "true":
+        resume = True
+    trainer.train(resume_from_checkpoint=resume)
     trainer.save_model(str(out_dir / "final"))
     logger.info("Done. Saved to %s", out_dir / "final")
 
@@ -455,5 +458,7 @@ if __name__ == "__main__":
     parser.add_argument("--steps",          type=int,   default=10_000)
     parser.add_argument("--lr",             type=float, default=5e-5)
     parser.add_argument("--warmup-steps",   type=int,   default=500)
+    parser.add_argument("--resume-from-checkpoint", default=None,
+                        help="Path to checkpoint dir to resume from, or 'true' for latest in out-dir")
     args = parser.parse_args()
     main(args)
